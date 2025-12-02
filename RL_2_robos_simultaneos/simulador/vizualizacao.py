@@ -27,6 +27,20 @@ def animar_trajetoria(env, trajetorias, salvar_video_path=None, interval=40):
     left_wall = ax.plot([-env.world_bounds, door_x_min], [wall_y, wall_y], lw=6, solid_capstyle='butt')[0]
     right_wall = ax.plot([door_x_max, env.world_bounds], [wall_y, wall_y], lw=6, solid_capstyle='butt')[0]
 
+    # desenhar porta como retângulo transparente
+    door_rect = plt.Rectangle(
+        (env.door_x_min, env.wall_y - env.robot_radius),   # canto inferior esquerdo
+        env.door_x_max - env.door_x_min,                   # largura da porta
+        2*env.robot_radius,                                # altura da zona de colisão
+        color='green', alpha=0.2, label='Zona da porta'
+    )
+    ax.add_patch(door_rect)
+
+    # opcional: desenhar linhas verticais delimitando a porta
+    ax.plot([env.door_x_min, env.door_x_min], [-world, world], 'g--', linewidth=1)
+    ax.plot([env.door_x_max, env.door_x_max], [-world, world], 'g--', linewidth=1)
+
+
     # destination
     dest = env.destino
     dest_marker = ax.plot(dest[0], dest[1], 'gx', markersize=12, label='Destino')[0]
