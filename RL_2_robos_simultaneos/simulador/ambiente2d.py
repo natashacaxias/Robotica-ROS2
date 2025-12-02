@@ -6,7 +6,7 @@ class Ambiente2D:
                  door_width=1.0,
                  wall_y=0.0,
                  dt=0.02,
-                 robot_radius=0.2):
+                 robot_radius=0.25):
 
         self.world_bounds = world_bounds
         self.door_width = door_width
@@ -17,8 +17,8 @@ class Ambiente2D:
         self.door_x_min = -door_width/2.0
         self.door_x_max =  door_width/2.0
 
-        self.start1 = np.array([-1.0, -4.0, np.pi/2])
-        self.start2 = np.array([ 1.0, -4.0, np.pi/2])
+        self.start1 = np.array([-0.4, -4.0, np.pi/2])
+        self.start2 = np.array([ 0.4, -4.0, np.pi/2])
 
         self.destino = np.array([0.0, 3.0])
         self.reset()
@@ -126,6 +126,9 @@ class Ambiente2D:
         s1, d1 = self._compute_state_from_pose(self.pose1)
         s2, d2 = self._compute_state_from_pose(self.pose2)
 
+        # calcular distância entre robôs
+        dist_between = np.linalg.norm(self.pose1[:2] - self.pose2[:2])
+
         # recompensa por se mover na direção certa
         reward += (prev_d1 - d1) + (prev_d2 - d2)
 
@@ -133,9 +136,18 @@ class Ambiente2D:
         reward += 0.1 * (1.0 - abs(s1[2]))  # robô 1
         reward += 0.1 * (1.0 - abs(s2[2]))  # robô 2
 
-        # penalidade por distância entre robôs
-        dist_between = np.linalg.norm(self.pose1[:2] - self.pose2[:2])
-        reward -= 0.05 * max(0.0, dist_between - 1.0)
+       # recompensa por manter proximidade segura
+        if 0.5 <= dist_between <= 1.0:
+            reward += 0.1
+
+        # penalidade por separação excessiva
+        if dist_between > 2.0:
+            reward -= 0.1 * (dist_between - 2.0)
+
+        # penalidade por proximidade excessiva (repulsão)
+        if dist_between < 0.4:
+            repulsion = (0.4 - dist_between) * 0.5
+            reward -= repulsion
 
         # penalidade por tempo
         reward -= 0.05
@@ -158,8 +170,10 @@ class Ambiente2D:
             self.passed2 = True
             self.pass_time2 = self.t
             reward += 50.0
-            if self.pass_time1 is not None and abs(self.pass_time1 - self.pass_time2) <= 40:
-                reward += 200.0
+            if self.pass_time1 is not None and self.pass_time2 is not None:
+                delta = abs(self.pass_time1 - self.pass_time2)
+                reward += max(0, 200 - 5*delta)  # quanto mais próximos no tempo, maior o bônus
+
 
         self.t += 1
         obs = np.concatenate([s1, s2]).astype(np.float32)
