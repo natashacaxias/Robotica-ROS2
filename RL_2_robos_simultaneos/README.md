@@ -17,3 +17,11 @@ source venv/bin/activate    # Linux / macOS
 venv\Scripts\activate       # Windows
 
 pip install -r requirements.txt
+
+## Executar o treinamento
+
+```bash
+cd /ros2_ws_g/RL_2_robos_simultaneos
+python3 treinamentos/treinar_dois_robos.py
+
+
