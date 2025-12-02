@@ -102,8 +102,8 @@ class Ambiente2D:
     # ===========================================================
     def step(self, action):
         a1, a2 = action
-        self.pose1 = self._step_robot(self.pose1, a1)
-        self.pose2 = self._step_robot(self.pose2, a2)
+        self.pose1 = self._step_robot(self.pose1, a1)  # líder
+        self.pose2 = self._step_robot(self.pose2, a2)  # seguidor
 
         done = False
         reward = 0.0
@@ -129,30 +129,25 @@ class Ambiente2D:
         # calcular distância entre robôs
         dist_between = np.linalg.norm(self.pose1[:2] - self.pose2[:2])
 
-        # recompensa por se mover na direção certa
+        # recompensa por se mover na direção certa (líder e seguidor)
         reward += (prev_d1 - d1) + (prev_d2 - d2)
 
         # recompensa por alinhamento
-        reward += 0.1 * (1.0 - abs(s1[2]))  # robô 1
-        reward += 0.1 * (1.0 - abs(s2[2]))  # robô 2
+        reward += 0.1 * (1.0 - abs(s1[2]))  # líder
+        reward += 0.1 * (1.0 - abs(s2[2]))  # seguidor
 
-       # recompensa por manter proximidade segura
-        if 0.5 <= dist_between <= 1.0:
-            reward += 0.1
+        # --- esquema líder-seguidor ---
+        dx = self.pose1[0] - self.pose2[0]   # diferença no eixo X
+        dy = self.pose1[1] - self.pose2[1]   # diferença no eixo Y
+        dist_ls = np.sqrt(dx*dx + dy*dy)
 
-        # penalidade por separação excessiva
-        if dist_between > 2.0:
-            reward -= min(1.0, 0.5 * (dist_between - 1.5))
-
-        delta_x = abs(self.pose1[0] - self.pose2[0])
-        delta_y = abs(self.pose1[1] - self.pose2[1])
-        if delta_y < 0.5 and delta_x < 0.5:
-            reward += 0.2  # estão se movendo juntos
-
-        # penalidade por proximidade excessiva (repulsão)
-        if dist_between < 0.4:
-            repulsion = (0.4 - dist_between) * 0.5
-            reward -= repulsion
+        # seguidor deve manter distância moderada do líder
+        if 0.5 <= dist_ls <= 1.0:
+            reward += 0.3   # bom seguidor
+        elif dist_ls > 2.0:
+            reward -= 0.3   # se afastou demais
+        elif dist_ls < 0.3:
+            reward -= 0.3   # ficou colado demais
 
         # penalidade por tempo
         reward -= 0.05
@@ -163,7 +158,7 @@ class Ambiente2D:
 
         # passagem pela porta
         if (self.pose1[1] > self.wall_y) and \
-           (self.door_x_min - 0.1 <= self.pose1[0] <= self.door_x_max + 0.1):
+        (self.door_x_min - 0.1 <= self.pose1[0] <= self.door_x_max + 0.1):
             self.passed1 = True
             self.pass_time1 = self.t
             reward += 50.0
@@ -177,16 +172,13 @@ class Ambiente2D:
             reward += 50.0
             if self.pass_time1 is not None and self.pass_time2 is not None:
                 delta = abs(self.pass_time1 - self.pass_time2)
-                reward += max(0, 300 - 5*delta)  # quanto mais próximos no tempo, maior o bônus
-
+                reward += max(0, 200 - 5*delta)
 
         self.t += 1
         obs = np.concatenate([s1, s2]).astype(np.float32)
 
         return obs, float(reward), bool(done), {}
 
-
-    # ===========================================================
     def render_state(self):
         return {
             'pose1': self.pose1.copy(),
