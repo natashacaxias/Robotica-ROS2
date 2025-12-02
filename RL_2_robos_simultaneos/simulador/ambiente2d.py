@@ -87,9 +87,9 @@ class Ambiente2D:
         x, y = pose[0], pose[1]
 
         if abs(y - self.wall_y) <= self.robot_radius:
-            if x < self.door_x_min - self.robot_radius - 0.05 or \
-               x > self.door_x_max + self.robot_radius + 0.05:
+            if not (self.door_x_min + self.robot_radius <= x <= self.door_x_max - self.robot_radius):
                 return True
+
 
         if abs(x) > self.world_bounds or abs(y) > self.world_bounds:
             return True
@@ -142,7 +142,12 @@ class Ambiente2D:
 
         # penalidade por separação excessiva
         if dist_between > 2.0:
-            reward -= 0.1 * (dist_between - 2.0)
+            reward -= min(1.0, 0.5 * (dist_between - 1.5))
+
+        delta_x = abs(self.pose1[0] - self.pose2[0])
+        delta_y = abs(self.pose1[1] - self.pose2[1])
+        if delta_y < 0.5 and delta_x < 0.5:
+            reward += 0.2  # estão se movendo juntos
 
         # penalidade por proximidade excessiva (repulsão)
         if dist_between < 0.4:
@@ -172,7 +177,7 @@ class Ambiente2D:
             reward += 50.0
             if self.pass_time1 is not None and self.pass_time2 is not None:
                 delta = abs(self.pass_time1 - self.pass_time2)
-                reward += max(0, 200 - 5*delta)  # quanto mais próximos no tempo, maior o bônus
+                reward += max(0, 300 - 5*delta)  # quanto mais próximos no tempo, maior o bônus
 
 
         self.t += 1
