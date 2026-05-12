@@ -1,0 +1,1025 @@
+import os
+import time
+import random
+import numpy as np
+import multiprocessing as mp
+from dataclasses import dataclass
+from collections import deque
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+# ==========================================================
+# CONFIG
+# ==========================================================
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f" usando dispositivo: {DEVICE}")
+if DEVICE.type == "cuda":
+    print(f" GPU: {torch.cuda.get_device_name(0)}")
+
+# Ajuste conforme seu hardware:
+# - CPU fraca: 2-4
+# - CPU mediana: 6-10
+# - CPU forte: 12-32
+NUM_ENVS = 12
+MAX_EPISODES = 10000 # Configuração de elite para a nova sala
+
+SEED = 42
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
+
+
+# ==========================================================
+# REPLAY BUFFER (centralizado)
+# - Thread-safe por lock (mesmo que o push aconteça no main)
+# ==========================================================
+class ReplayBuffer:
+    def __init__(self, capacity: int):
+        self.capacity = int(capacity)
+        self.buf = [None] * self.capacity
+        self.pos = 0
+        self.size = 0
+        self.lock = mp.Lock()
+
+    def push(self, s, a, r, ns, d):
+        # Centralizado e protegido para suportar inserções concorrentes se necessário
+        with self.lock:
+            self.buf[self.pos] = (s, a, r, ns, d)
+            self.pos = (self.pos + 1) % self.capacity
+            self.size = min(self.size + 1, self.capacity)
+
+    def sample(self, batch_size: int):
+        with self.lock:
+            idx = np.random.randint(0, self.size, size=batch_size)
+            batch = [self.buf[i] for i in idx]
+
+        s, a, r, ns, d = map(np.stack, zip(*batch))
+        return s, a, r, ns, d
+
+    def __len__(self):
+        return self.size
+
+
+# ==========================================================
+# DQN (mesma arquitetura base do seu código)
+# ==========================================================
+class DuelingDQN(nn.Module):
+    def __init__(self, inp: int, out: int, h: int = 512):
+        super().__init__()
+        # Extrator de features (Deep: 3 camadas)
+        self.fe = nn.Sequential(
+            nn.Linear(inp, h),
+            nn.ReLU(),
+            nn.Linear(h, h),
+            nn.ReLU(),
+            nn.Linear(h, h),
+            nn.ReLU(),
+        )
+        
+        # Fluxo de Valor (V)
+        self.v_head = nn.Sequential(
+            nn.Linear(h, h // 2),
+            nn.ReLU(),
+            nn.Linear(h // 2, 1)
+        )
+        
+        # Fluxo de Vantagem (A)
+        self.a_head = nn.Sequential(
+            nn.Linear(h, h // 2),
+            nn.ReLU(),
+            nn.Linear(h // 2, out)
+        )
+
+    def forward(self, x):
+        feat = self.fe(x)
+        v = self.v_head(feat)
+        a = self.a_head(feat)
+        # Combinação Dueling: Q(s,a) = V(s) + (A(s,a) - mean(A(s,a)))
+        return v + (a - a.mean(dim=1, keepdim=True))
+
+
+# ==========================================================
+# ENV (copiado/compatível com o seu)
+# ==========================================================
+class LeaderFollowerEnv:
+    def __init__(self):
+        # Fisica
+        self.dt = 0.05
+        self.sub = 4
+        self.delay = 4
+        self.buf_size = 200
+
+        # Ações Golden Ratio (Fibonacci: 5 e 8)
+        self.v_vals = np.linspace(0.0, 0.5, 5)
+        self.w_vals = np.linspace(-1.0, 1.0, 8)
+        self.na = len(self.v_vals) * len(self.w_vals)
+
+        # Seguidor
+        self.max_v_f = 0.45
+        self.kp_d = 1.0
+        self.kp_a = 1.4
+
+        # ---- GEOMETRIA DA SALA 8x8 ----
+        self.room_xmin = 0.0
+        self.room_xmax = 8.0
+        self.room_ymin = 0.0
+        self.room_ymax = 8.0
+
+        # Parede interna horizontal em y=4, de x=0 ate x=6
+        self.inner_wall_y = 4.0
+        self.inner_wall_xmin = 0.0
+        self.inner_wall_xmax = 6.0
+
+        # Gap (brecha) de x=6 ate x=8 (lado direito)
+        self.gap_xmin = 6.0
+        self.gap_xmax = 8.0
+
+        # Porta de saida na parede DIREITA, PERTO DA PAREDE INFERIOR
+        self.door_ymin = 0.5
+        self.door_ymax = 1.5
+
+        # Zona de spawn (amarela) — ACIMA da parede interna
+        self.spawn_xmin = 1.5
+        self.spawn_xmax = 3.5
+        self.spawn_ymin = 5.0
+        self.spawn_ymax = 7.0
+
+        # Goal — fora da sala, alinhado com a porta
+        self.goal_xmin = 9.0
+        self.goal_xmax = 10.0
+        self.goal_ymin = 0.7
+        self.goal_ymax = 1.3
+
+        # Seguranca (P3-AT: ~0.5m largura)
+        self.min_safe_dist = 0.80
+        self.collision_dist = 0.50
+        self.desired_dist = 0.90
+        self.spawn_radius = 0.80
+
+        # Estado
+        self.goal = None
+        self.leader = np.zeros(3)
+        self.follower = np.zeros(3)
+        self.buffer = deque(maxlen=self.buf_size)
+
+        # Checkpoints
+        self.passed_breach = False
+        self.passed_door = False
+
+        # Logging
+        self.v_leader = 0.0
+        self.w_leader = 0.0
+        self.v_follower = 0.0
+        self.w_follower = 0.0
+
+    @staticmethod
+    def wrap(a):
+        return (a + np.pi) % (2 * np.pi) - np.pi
+
+    def _collides_inner_wall(self, p1, p2):
+        x1, y1 = p1
+        x2, y2 = p2
+        wy = self.inner_wall_y
+        radius = self.collision_dist / 2.0
+        if (y1 - wy) * (y2 - wy) <= 0:
+            if abs(y2 - y1) > 1e-9:
+                t = (wy - y1) / (y2 - y1)
+                if 0 <= t <= 1:
+                    xcross = x1 + t * (x2 - x1)
+                    # O gap é entre 6.0 e 8.0. Com raio de 25cm, centro deve estar > 6.25
+                    if xcross <= self.inner_wall_xmax + radius:
+                        return True
+        return False
+
+    def _collides_room_walls(self, x, y):
+        radius = self.collision_dist / 2.0
+        # Paredes externas esquerda, baixo, cima
+        if x < self.room_xmin + radius or y < self.room_ymin + radius or y > self.room_ymax - radius:
+            return True
+        # Parede direita com porta
+        if x > self.room_xmax - radius:
+            # So passa se o centro estiver entre door_min+pos e door_max-pos
+            if self.door_ymin + radius <= y <= self.door_ymax - radius:
+                return False
+            return True
+        return False
+
+    def _is_through_breach(self, x, y):
+        return (y < self.inner_wall_y and self.gap_xmin <= x <= self.gap_xmax)
+
+    def _is_through_door(self, x, y):
+        return (x >= self.room_xmax and self.door_ymin <= y <= self.door_ymax)
+
+    def _step_uni(self, pose, v, w):
+        x, y, th = pose
+        for _ in range(self.sub):
+            nx = x + self.dt * v * np.cos(th)
+            ny = y + self.dt * v * np.sin(th)
+            nth = self.wrap(th + self.dt * w)
+            if self._collides_inner_wall((x, y), (nx, ny)): return np.array([x, y, nth])
+            if self._collides_room_walls(nx, ny): return np.array([x, y, nth])
+            x, y, th = nx, ny, nth
+        return np.array([x, y, th])
+
+    def _foll_ctrl(self, pose, tgt):
+        x, y, th = pose
+        tx, ty = tgt
+        dx, dy = tx - x, ty - y
+        dist = np.hypot(dx, dy)
+        ang = np.arctan2(dy, dx)
+        err = self.wrap(ang - th)
+        if dist < self.min_safe_dist:
+            return 0.0, np.clip(self.kp_a * err, -1.0, 1.0)
+        v = np.clip(self.kp_d * dist, 0, self.max_v_f)
+        w = np.clip(self.kp_a * err, -1.5, 1.5)
+        return v, w
+
+    def _state(self):
+        Lx, Ly, Lth = self.leader
+        Fx, Fy, Fth = self.follower
+        gx, gy = self.goal
+        dist_goal = np.hypot(gx - Lx, gy - Ly)
+        pair = np.hypot(Lx - Fx, Ly - Fy)
+        heading = np.arctan2(gy - Ly, gx - Lx)
+        ang = self.wrap(Lth - heading)
+        return np.array([
+            gx - Lx, gy - Ly, dist_goal, pair,
+            np.sin(Lth), np.cos(Lth), np.sin(Fth), np.cos(Fth),
+            ang,
+            1.0 if self.passed_breach else 0.0,
+            1.0 if self.passed_door else 0.0
+        ], dtype=np.float32)
+
+    def reset(self):
+        lx = np.random.uniform(self.spawn_xmin + 0.3, self.spawn_xmax - 0.3)
+        ly = np.random.uniform(self.spawn_ymin + 0.3, self.spawn_ymax - 0.3)
+        lth = np.random.uniform(-np.pi, np.pi)
+        self.leader = np.array([lx, ly, lth])
+        for _ in range(40):
+            ang = np.random.uniform(0, 2 * np.pi)
+            d = np.random.uniform(0.15, self.spawn_radius)
+            fx, fy = lx + d * np.cos(ang), ly + d * np.sin(ang)
+            if self.room_xmin < fx < self.room_xmax and self.room_ymin < fy < self.room_ymax: break
+        self.follower = np.array([fx, fy, np.random.uniform(-np.pi, np.pi)])
+        self.goal = np.array([np.random.uniform(self.goal_xmin, self.goal_xmax),
+                             np.random.uniform(self.goal_ymin, self.goal_ymax)])
+        self.passed_breach = False
+        self.passed_door = False
+        self.buffer.clear()
+        self.buffer.append(self.leader[:2].copy())
+        return self._state()
+
+    def step(self, action: int):
+        vi = action // 8
+        wi = action % 8
+        v, w = self.v_vals[vi], self.w_vals[wi]
+        old_leader = self.leader.copy()
+        self.leader = self._step_uni(self.leader, v, w)
+        self.v_leader, self.w_leader = v, w
+        self.buffer.append(self.leader[:2].copy())
+        idx = max(0, len(self.buffer) - 1 - self.delay)
+        vf, wf = self._foll_ctrl(self.follower, self.buffer[idx])
+        self.follower = self._step_uni(self.follower, vf, wf)
+        self.v_follower, self.w_follower = vf, wf
+
+        st = self._state()
+        dist_goal = st[2]
+        pair = st[3]
+        ang = abs(st[8])
+
+        reward = -0.05
+        reward -= 0.1 * (self.w_leader**2)
+        reward += 0.1 * self.v_leader * np.cos(ang)
+
+        # Magnet Jackpot
+        if dist_goal < 0.3 or self.leader[0] > self.goal[0]:
+            r_final = 1000.0
+            if abs(self.leader[1] - self.goal[1]) < 0.2: r_final += 200
+            return st, r_final, True, {"reason": "passed_goal"}
+
+        if pair < self.min_safe_dist: reward -= 5.0
+        if pair < self.collision_dist: return st, -150.0, True, {"reason": "collision"}
+
+        # Checkpoints
+        if not self.passed_breach and self._is_through_breach(self.leader[0], self.leader[1]):
+            self.passed_breach = True
+            reward += 300.0
+        if self.passed_breach and not self.passed_door and self._is_through_door(self.leader[0], self.leader[1]):
+            self.passed_door = True
+            reward += 500.0
+
+        return st, float(reward), False, {}
+
+    def poses(self):
+        return self.leader.copy(), self.follower.copy(), self.goal.copy()
+
+
+# ==========================================================
+# WORKER PROCESS
+# - Cada worker tem um env independente e só faz reset/step.
+# - O paralelismo acontece aqui.
+# ==========================================================
+def env_worker(remote, seed: int):
+    try:
+        np.random.seed(seed)
+        random.seed(seed)
+
+        env = LeaderFollowerEnv()
+        obs = env.reset()
+
+        remote.send(("reset_ok", obs))
+
+        while True:
+            cmd, data = remote.recv()
+
+            if cmd == "step":
+                action = int(data)
+                next_obs, reward, done, info = env.step(action)
+                if done:
+                    next_obs = env.reset()  # auto-reset local
+                remote.send(("step_ok", (next_obs, reward, done, info)))
+
+            elif cmd == "get_obs":
+                remote.send(("obs_ok", obs))
+
+            elif cmd == "close":
+                remote.close()
+                break
+
+            else:
+                remote.send(("err", f"Unknown cmd: {cmd}"))
+
+            # guarda obs atual (para depuração se quiser)
+            if cmd == "step":
+                obs = next_obs
+
+    except Exception as e:
+        remote.send(("crash", repr(e)))
+        remote.close()
+
+
+class ParallelEnvs:
+    """
+    Gerenciador simples tipo SubprocVectorEnv, mas independente de Gym.
+    - Uma ação por env
+    - step() retorna batch (obs, rewards, dones, infos)
+    """
+
+    def __init__(self, n_envs: int, base_seed: int = 0):
+        self.n_envs = int(n_envs)
+        self.remotes, self.work_remotes = zip(*[mp.Pipe() for _ in range(self.n_envs)])
+        self.ps = []
+
+        for i in range(self.n_envs):
+            s = base_seed + 10_000 * i
+            p = mp.Process(target=env_worker, args=(self.work_remotes[i], s), daemon=True)
+            p.start()
+            self.ps.append(p)
+            self.work_remotes[i].close()
+
+        # receber reset de todos
+        obs = []
+        for r in self.remotes:
+            msg, payload = r.recv()
+            assert msg == "reset_ok", (msg, payload)
+            obs.append(payload)
+
+        self.obs = np.stack(obs, axis=0)  # (n_envs, obs_dim)
+
+    def step(self, actions: np.ndarray):
+        """
+        Paralelismo:
+        - envia ações para todos os workers
+        - recebe respostas de todos
+        """
+        assert len(actions) == self.n_envs
+
+        for r, a in zip(self.remotes, actions):
+            r.send(("step", int(a)))
+
+        next_obs, rewards, dones, infos = [], [], [], []
+        for r in self.remotes:
+            msg, payload = r.recv()
+            if msg == "crash":
+                raise RuntimeError(f"Worker crashed: {payload}")
+            assert msg == "step_ok", (msg, payload)
+
+            ob, rew, done, info = payload
+            next_obs.append(ob)
+            rewards.append(rew)
+            dones.append(done)
+            infos.append(info)
+
+        self.obs = np.stack(next_obs, axis=0)
+        return self.obs, np.array(rewards, dtype=np.float32), np.array(dones, dtype=np.bool_), infos
+
+    def close(self):
+        for r in self.remotes:
+            try:
+                r.send(("close", None))
+            except Exception:
+                pass
+        for p in self.ps:
+            p.join(timeout=1.0)
+
+
+# ==========================================================
+# TRAINER (DQN único + buffer central)
+# ==========================================================
+@dataclass
+class TrainConfig:
+    # ===== RL =====
+    gamma: float = 0.99
+    batch: int = 64
+    lr: float = 1e-3
+
+    # ===== Replay Buffer =====
+    buffer_capacity: int = 100000
+    min_buffer: int = 2000
+
+    # ===== Epsilon =====
+    eps_start: float = 1.0
+    eps_min: float = 0.05
+    eps_decay: float = 0.9993
+
+    # ===== Paralelismo =====
+    num_envs: int = 12
+
+    # ===== Treino =====
+    max_episodes: int = 10000
+    train_every: int = 1
+    target_sync_every: int = 3000
+    grad_steps_per_update: int = 1
+
+    print_every_episodes: int = 200
+    log_transitions: bool = False   
+
+class DQNParallelTrainer:
+    def __init__(self, n_envs: int, cfg: TrainConfig):
+        self.cfg = cfg
+        self.envs = ParallelEnvs(n_envs=n_envs, base_seed=SEED)
+       
+
+        obs_dim = self.envs.obs.shape[1]
+        # ação vem do próprio env
+        sample_env = LeaderFollowerEnv() # Create a temporary env to get action space
+        obs_dim = 11  # gx, gy, dist, pair, sinL, cosL, sinF, cosF, ang, breach, door
+        self.act_dim = sample_env.na
+
+        self.policy = DuelingDQN(obs_dim, self.act_dim).to(DEVICE) # Use act_dim here
+        self.target = DuelingDQN(obs_dim, self.act_dim).to(DEVICE) # Use act_dim here
+        self.target.load_state_dict(self.policy.state_dict())
+
+        self.opt = optim.Adam(self.policy.parameters(), lr=cfg.lr)
+
+        # Mixed Precision (AMP)
+        self.scaler = torch.amp.GradScaler('cuda') if DEVICE.type == "cuda" else None
+        self.buf = ReplayBuffer(cfg.buffer_capacity)
+
+        self.eps = cfg.eps_start
+        self.global_step = 0  # conta steps "vetorizados"? aqui contamos steps globais por transição
+        self.total_transitions = 0
+
+        self.episode_count = 0
+        self.last_logged_episode = -1
+        self.episode_rewards = np.zeros(self.envs.n_envs)
+
+    @torch.no_grad()
+    def act_batch(self, obs_batch: np.ndarray):
+        """
+        Seleciona ações para todos os envs:
+        - eps-greedy
+        - UMA rede para todos
+        """
+        n = obs_batch.shape[0]
+        actions = np.zeros(n, dtype=np.int64)
+
+        # amostras aleatórias
+        rand_mask = np.random.rand(n) < self.eps
+        actions[rand_mask] = np.random.randint(0, self.act_dim, size=rand_mask.sum())
+
+        # ações greedy
+        if (~rand_mask).any():
+            obs_t = torch.from_numpy(obs_batch[~rand_mask]).float().to(DEVICE)
+            q = self.policy(obs_t)
+            actions[~rand_mask] = q.argmax(dim=1).cpu().numpy().astype(np.int64)
+
+        return actions
+
+    def update(self):
+        if len(self.buf) < self.cfg.min_buffer:
+            return
+
+        for _ in range(self.cfg.grad_steps_per_update):
+            s, a, r, ns, d = self.buf.sample(self.cfg.batch)
+
+            s = torch.from_numpy(s).float().to(DEVICE)
+            ns = torch.from_numpy(ns).float().to(DEVICE)
+            a = torch.from_numpy(a).long().to(DEVICE).view(-1, 1)
+            r = torch.from_numpy(r).float().to(DEVICE).view(-1, 1)
+            d = torch.from_numpy(d).float().to(DEVICE).view(-1, 1)
+
+            with torch.amp.autocast(device_type=DEVICE.type, enabled=(self.scaler is not None)):
+                q = self.policy(s).gather(1, a)
+                
+                with torch.no_grad():
+                    # Double DQN: policy escolhe a ação, target avalia o valor
+                    best_next_actions = self.policy(ns).argmax(dim=1, keepdim=True)
+                    max_next = self.target(ns).gather(1, best_next_actions)
+                    
+                    target = r + (1.0 - d) * self.cfg.gamma * max_next
+
+                loss = nn.MSELoss()(q, target)
+
+            self.opt.zero_grad(set_to_none=True)
+            if self.scaler:
+                self.scaler.scale(loss).backward()
+                self.scaler.step(self.opt)
+                self.scaler.update()
+            else:
+                loss.backward()
+                self.opt.step()
+
+    def train(self):
+        start_time = time.time()
+        obs = self.envs.obs
+        t0 = time.time()
+
+        while self.episode_count < self.cfg.max_episodes:
+            # 1) ações
+            actions = self.act_batch(obs)
+
+            # 2) step paralelo
+            next_obs, rewards, dones, infos = self.envs.step(actions)
+
+            for i in range(self.envs.n_envs):
+                # replay buffer (UMA VEZ)
+                self.buf.push(
+                    obs[i],
+                    actions[i],
+                    rewards[i],
+                    next_obs[i],
+                    float(dones[i]),
+                )
+
+                self.episode_rewards[i] += rewards[i]
+
+                # episódio terminou
+                if dones[i]:
+                    self.episode_count += 1
+                    self.episode_rewards[i] = 0.0
+
+                    # STATUS controlado
+                    if (
+                        self.episode_count > 0
+                        and self.episode_count % self.cfg.print_every_episodes == 0
+                        and self.episode_count != self.last_logged_episode
+                    ):
+                        print(
+                            f"[STATUS] Episodes={self.episode_count}/{self.cfg.max_episodes} | "
+                            f"Eps={self.eps:.3f} | Buffer={len(self.buf)}"
+                        )
+                        self.last_logged_episode = self.episode_count
+
+            obs = next_obs
+            self.total_transitions += self.envs.n_envs
+
+            # 3) treino
+            if (self.total_transitions // self.envs.n_envs) % self.cfg.train_every == 0:
+                self.update()
+
+            # 4) sync target
+            if (self.total_transitions // self.envs.n_envs) % self.cfg.target_sync_every == 0:
+                self.target.load_state_dict(self.policy.state_dict())
+
+            # 5) epsilon decay
+            self.eps = max(self.cfg.eps_min, self.eps * self.cfg.eps_decay)
+
+            # log de throughput (independente)
+            if self.cfg.log_transitions:
+                if self.total_transitions % (self.envs.n_envs * 500) == 0:
+                    dt = time.time() - t0
+                    sps = self.total_transitions / max(dt, 1e-6)
+                    print(
+                        f"[train] transitions={self.total_transitions} | "
+                        f"eps={self.eps:.3f} | buffer={len(self.buf)} | SPS={sps:.0f}"
+                    )
+
+
+        # tempo final
+        elapsed = time.time() - start_time
+        avg_time_per_ep = elapsed / max(1, self.episode_count)
+
+        h = int(elapsed // 3600)
+        m = int((elapsed % 3600) // 60)
+        s = elapsed % 60
+
+        print("\n================ TREINO FINALIZADO ================")
+        print(f"Total de episódios: {self.episode_count}")
+        print(f"Tempo total de treino: {h:02d}:{m:02d}:{s:05.2f}")
+        print(f"Tempo médio por episódio: {avg_time_per_ep:.3f} s")
+        print("===================================================\n")
+
+        self.envs.close()
+
+
+
+# ==========================================================
+# COLETA DE UM EPISÓDIO (CSV)
+# ==========================================================
+import csv
+import matplotlib.pyplot as plt
+import matplotlib.animation as animation
+import pandas as pd
+
+
+def run_episode_collect(agent, set_start_fn, episode_id, out_dir="logs", max_steps=300):
+    os.makedirs(out_dir, exist_ok=True)
+
+    env = agent.env if hasattr(agent, "env") else LeaderFollowerEnv()
+    st = env.reset()
+    set_start_fn(env)
+    st = env._state()
+
+    plot_initial_positions(env, title=f"Cenário inicial – {episode_id.upper()}")
+
+    filepath = f"{out_dir}/episode_{episode_id}.csv"
+
+    with open(filepath, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "t",
+            "leader_x","leader_y","leader_theta",
+            "leader_v","leader_w",
+            "follower_x","follower_y","follower_theta",
+            "follower_v","follower_w",
+            "goal_x", "goal_y",
+            "reward","reason"
+        ])
+
+        t = 0.0
+        done = False
+        steps = 0
+        reason = ""
+
+        l = env.leader
+        f0 = env.follower
+        g = env.goal
+        writer.writerow([
+            t,
+            l[0], l[1], l[2],
+            env.v_leader, env.w_leader,
+            f0[0], f0[1], f0[2],
+            env.v_follower, env.w_follower,
+            g[0], g[1],
+            0.0, ""
+        ])
+
+        while not done and steps < max_steps:
+            a = agent.act(st, greedy=True)
+            st, r, done, info = env.step(a)
+
+            t += env.dt * env.sub
+            steps += 1
+            l = env.leader
+            f0 = env.follower
+            g = env.goal
+            reason = info.get("reason", "")
+
+            writer.writerow([
+                t,
+                l[0], l[1], l[2],
+                env.v_leader, env.w_leader,
+                f0[0], f0[1], f0[2],
+                env.v_follower, env.w_follower,
+                g[0], g[1],
+                r,
+                reason if done else ""
+            ])
+
+    return filepath
+
+
+# ==========================================================
+# PLOTS DE UM EPISÓDIO
+# ==========================================================
+def plot_episode(filepath, out_dir=None):
+    df = pd.read_csv(filepath)
+    df = df[df["leader_x"].notna()]
+    t = df["t"]
+
+    if out_dir is None:
+        out_dir = os.path.dirname(filepath)
+    os.makedirs(out_dir, exist_ok=True)
+
+    base = os.path.splitext(os.path.basename(filepath))[0]
+
+    # === POSIÇÃO ===
+    plt.figure(figsize=(8, 8))
+    plt.plot(df["leader_x"], df["leader_y"], label="Leader")
+    plt.plot(df["follower_x"], df["follower_y"], label="Follower")
+    
+    # Desenha Sala 8x8
+    plt.plot([0, 8], [0, 0], "k-", lw=2)
+    plt.plot([0, 8], [8, 8], "k-", lw=2)
+    plt.plot([0, 0], [0, 8], "k-", lw=2)
+    plt.plot([8, 8], [0, 0.5], "k-", lw=2)
+    plt.plot([8, 8], [1.5, 8], "k-", lw=2)
+    plt.plot([8, 8], [0.5, 1.5], "g-", lw=4, alpha=0.3)
+    plt.plot([0, 6], [4, 4], "k-", lw=2)
+    
+    plt.xlabel("X (m)")
+    plt.ylabel("Y (m)")
+    plt.title("Trajetória na Sala 8x8")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.gca().set_aspect("equal")
+    plt.grid(True)
+    plt.savefig(os.path.join(out_dir, f"{base}_pose.png"), dpi=200, bbox_inches="tight")
+    plt.close()
+
+    # === VELOCIDADES ===
+    plt.figure(figsize=(10, 6))
+    plt.plot(t, df["leader_v"], label="Leader v")
+    plt.plot(t, df["leader_w"], label="Leader w")
+    plt.plot(t, df["follower_v"], label="Follower v")
+    plt.plot(t, df["follower_w"], label="Follower w")
+    plt.xlabel("Tempo (s)")
+    plt.ylabel("Velocidade")
+    plt.title("Velocidades vs Tempo")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig(os.path.join(out_dir, f"{base}_vel.png"), dpi=200, bbox_inches="tight")
+    plt.close()
+
+    print(f"[OK] Gráficos salvos para {base}")
+
+
+# ==========================================================
+# PLOT DAS POSIÇÕES INICIAIS
+# ==========================================================
+def plot_initial_positions(env, title="Ambiente LeaderFollower"):
+    import matplotlib.patches as mpatches
+    plt.figure(figsize=(8, 8))
+    plt.xlim(-1, 11)
+    plt.ylim(-1, 9)
+    plt.gca().set_aspect("equal")
+
+    # Paredes Sala
+    plt.plot([0, 8], [0, 0], "k-", lw=4)
+    plt.plot([0, 8], [8, 8], "k-", lw=4)
+    plt.plot([0, 0], [0, 8], "k-", lw=4)
+    plt.plot([8, 8], [0, 0.5], "k-", lw=4)
+    plt.plot([8, 8], [1.5, 8], "k-", lw=4)
+    plt.plot([8, 8], [0.5, 1.5], "g-", lw=6) # Porta
+    
+    # Parede Interna
+    plt.plot([0, 6], [4, 4], "k-", lw=4)
+
+    plt.scatter(env.leader[0], env.leader[1], c="blue", s=100, label="Leader")
+    plt.scatter(env.follower[0], env.follower[1], c="red", s=100, label="Follower")
+    plt.scatter(env.goal[0], env.goal[1], c="green", s=200, marker="*", label="Goal")
+
+    plt.title(title)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.show()
+
+
+def animate_episode(filepath, out_dir=None, fps=20):
+    df = pd.read_csv(filepath)
+    df = df[df["leader_x"].notna()]
+    
+    if out_dir is None:
+        out_dir = os.path.dirname(filepath)
+    os.makedirs(out_dir, exist_ok=True)
+    
+    base = os.path.splitext(os.path.basename(filepath))[0]
+    
+    # Configuração da figura
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.set_aspect("equal")
+    ax.set_xlim(-1, 11)
+    ax.set_ylim(-1, 9)
+    ax.grid(True, alpha=0.3)
+    
+    # Desenha Sala 8x8
+    ax.plot([0, 8], [0, 0], "k-", lw=4)
+    ax.plot([0, 8], [8, 8], "k-", lw=4)
+    ax.plot([0, 0], [0, 8], "k-", lw=4)
+    ax.plot([8, 8], [0, 0.5], "k-", lw=4)
+    ax.plot([8, 8], [1.5, 8], "k-", lw=4)
+    ax.plot([8, 8], [0.5, 1.5], "g-", lw=6, alpha=0.3) # Porta
+    ax.plot([0, 6], [4, 4], "k-", lw=4) # Parede Interna
+    
+    # Elementos da animação (P3-AT: markersize=18 representa ~50cm no mapa de 12m)
+    leader_plot, = ax.plot([], [], "bo", markersize=18, label="Leader")
+    follower_plot, = ax.plot([], [], "ro", markersize=18, label="Follower")
+    goal_marker, = ax.plot([], [], "g*", markersize=15, label="Goal")
+    
+    # Rastros
+    leader_trail, = ax.plot([], [], "b-", alpha=0.3, lw=1)
+    follower_trail, = ax.plot([], [], "r-", alpha=0.3, lw=1)
+    
+    time_text = ax.text(0.05, 0.95, "", transform=ax.transAxes)
+    
+    def init():
+        leader_plot.set_data([], [])
+        follower_plot.set_data([], [])
+        
+        # O Goal é o mesmo em todo o arquivo
+        gx, gy = df["goal_x"].iloc[0], df["goal_y"].iloc[0]
+        goal_marker.set_data([gx], [gy])
+        
+        leader_trail.set_data([], [])
+        follower_trail.set_data([], [])
+        time_text.set_text("")
+        return leader_plot, follower_plot, goal_marker, leader_trail, follower_trail, time_text
+
+    def update(frame):
+        # O objetivo é fixo em cada episódio, mas vamos pegar do CSV se possível?
+        # No CSV atual não salvamos o Goal. Mas sabemos que ele é o ponto onde o robô termina se ganhar.
+        # Por enquanto, vamos assumir que o objetivo está na última posição do líder se reason for passed_goal
+        
+        row = df.iloc[frame]
+        
+        # Objetivo (tentar inferir se não tiver)
+        # Como o objetivo não está no CSV, vamos usar uma posição fixa aproximada 
+        # baseada nos cenários se soubermos qual é o arquivo, ou apenas ignorar o marcador se não soubermos.
+        # Melhor: vamos apenas plotar os robôs.
+        
+        leader_plot.set_data([row["leader_x"]], [row["leader_y"]])
+        follower_plot.set_data([row["follower_x"]], [row["follower_y"]])
+        
+        leader_trail.set_data(df["leader_x"][:frame+1], df["leader_y"][:frame+1])
+        follower_trail.set_data(df["follower_x"][:frame+1], df["follower_y"][:frame+1])
+        
+        time_text.set_text(f"Time: {row['t']:.2f}s")
+        return leader_plot, follower_plot, leader_trail, follower_trail, time_text
+
+    ani = animation.FuncAnimation(fig, update, frames=len(df), init_func=init, blit=True, interval=1000/fps)
+    
+    gif_path = os.path.join(out_dir, f"{base}_animation.gif")
+    ani.save(gif_path, writer="pillow", fps=fps)
+    plt.close(fig)
+    print(f"[OK] Animação salva em {gif_path}")
+
+# ==========================================================
+# DEFINIÇÃO DOS CENÁRIOS (EASY / MEDIUM / HARD)
+# ==========================================================
+def set_start_easy(env):
+    """Cenario facil: lider ja passou pela brecha (gap), indo para a porta."""
+    env.leader = np.array([7.0, 2.0, 0.0])
+    env.follower = np.array([6.5, 2.0, 0.0])
+    env.passed_breach = True
+    env.passed_door = False
+
+def set_start_medium(env):
+    """Cenario medio: lider na parte de cima, apontando para o gap."""
+    env.leader = np.array([2.5, 6.0, -0.5])
+    env.follower = np.array([2.0, 6.0, -0.5])
+    env.passed_breach = False
+    env.passed_door = False
+
+def set_start_hard(env):
+    """
+    Cenário difícil:
+    - líder muito próximo à parede (X=0.5)
+    - grande deslocamento lateral (Y=-2.0) e rotação
+    - exige manobra brusca para entrar na porta
+    """
+    env.leader = np.array([env.wall_x - 1.5, -2.0, np.pi/2])
+    env.goal = np.array([env.wall_x + 3.0, 0.0])
+    env.follower = env.leader.copy()
+    env.follower[1] -= 0.6 # Fica atrás no eixo Y (já que o líder aponta para cima)
+
+# ==========================================================
+# AGENTE DE AVALIAÇÃO (WRAPPER)
+# ==========================================================
+class EvalAgent:
+    """
+    Wrapper leve para avaliação:
+    - usa a policy treinada no DQN paralelo
+    - mantém interface compatível com o código original
+    """
+    def __init__(self, policy, env):
+        self.policy = policy
+        self.env = env
+
+    def act(self, state, greedy=True):
+        with torch.no_grad():
+            s = torch.from_numpy(state).float().unsqueeze(0).to(DEVICE)
+            q = self.policy(s)
+            return int(q.argmax())
+# ==========================================================
+# AVALIAÇÃO POR DIFICULDADE (EASY / MEDIUM / HARD)
+# ==========================================================
+def evaluate_difficulty(agent, set_start_fn, name, n_episodes=10):
+    successes = 0
+    reasons = {}
+
+    for i in range(n_episodes):
+        env = agent.env
+        st = env.reset()
+        set_start_fn(env)
+        st = env._state()
+
+        done = False
+        steps = 0
+        info = {}
+
+        while not done and steps < 300:
+            a = agent.act(st, greedy=True)
+            st, r, done, info = env.step(a)
+            steps += 1
+
+        reason = info.get("reason", "unknown")
+        reasons[reason] = reasons.get(reason, 0) + 1
+
+        if reason == "passed_goal":
+            successes += 1
+
+    success_rate = successes / n_episodes
+
+    # ===== PRINT CLARO (ARTIGO / TERMINAL) =====
+    print("\n==============================")
+    print(f"Dificuldade: {name.upper()}")
+    print(f"Sucessos: {successes}/{n_episodes}")
+    print(f"Taxa de sucesso: {success_rate:.2f}")
+    print("Motivos de término:")
+    for k, v in reasons.items():
+        print(f"  {k}: {v}")
+    print("==============================\n")
+
+    return success_rate, reasons
+
+
+if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
+
+    # =========================
+    # CONFIGURAÇÃO DE TREINO
+    # =========================
+    cfg = TrainConfig(
+        gamma=0.99,
+        batch=64,
+        lr=1e-3,
+        buffer_capacity=100000,
+        min_buffer=2000,
+        eps_start=1.0,
+        eps_min=0.05,
+        eps_decay=0.9998,
+        max_episodes=10000,
+        train_every=1,
+        target_sync_every=3000,
+        grad_steps_per_update=1,
+    )
+
+    print(f"Rodando com NUM_ENVS={NUM_ENVS}")
+    trainer = DQNParallelTrainer(n_envs=NUM_ENVS, cfg=cfg)
+
+    # =========================
+    # TREINO
+    # =========================
+    trainer.train()
+
+    # =========================
+    # AGENTE DE AVALIAÇÃO
+    # =========================
+    eval_env = LeaderFollowerEnv()
+    agent = EvalAgent(trainer.policy, eval_env)
+
+    # =========================
+    # CENÁRIOS DE TESTE
+    # =========================
+    scenarios = [
+        ("easy", set_start_easy),
+        ("medium", set_start_medium),
+        ("hard", set_start_hard),
+    ]
+
+    # =========================
+    # COLETA + GRÁFICOS
+    # =========================
+    for name, start_fn in scenarios:
+        print(f"\n=== COLETA | {name.upper()} ===")
+
+        csv_path = run_episode_collect(
+            agent,
+            start_fn,
+            episode_id=name,
+            out_dir=f"logs/{name}"
+        )
+
+        plot_episode(csv_path)
+        animate_episode(csv_path)
+
+    # =========================
+    # AVALIAÇÃO ESTATÍSTICA
+    # =========================
+    for name, fn in scenarios:
+        evaluate_difficulty(agent, fn, name, n_episodes=500)
+
+    print("\nExecução finalizada com sucesso.")

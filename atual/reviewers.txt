@@ -1,0 +1,54 @@
+Reviewer #1
+
+1. Originality of the work (How do you evaluate the originality of the work presented in this paper ?)
+3. Average originality
+2. Contribution to the field (How do do you evaluate the paper's contribution to the field?):
+2. Minor contribution
+3. Technical strength (How do you evaluate the technical strength of the paper?):
+1. Unacceptable
+4. Paper Clarity and Organization (How do you evaluate the clarity and organization of the paper?)
+2. Poor
+5. Recommendation for this paper (What do you recommend for this paper?):
+1. Strong Reject - I have strong arguments against acceptance
+6. Comments to the authors (Please provide the authors some feedback on the scores you gave for the originality of the work, contribution to the field, technical strength, clarity and organization multiple choice reviews, and also provide some feedback on how they can improve their paper):
+In this paper, the authors explore the area of multi-agent systems and formation control. They use reinforcement learning for the leader robot's position control with obstacle avoidance, while the followers use a simple proportional gain controller to track a point behind the leader. Results are shown for a scenario with a leader and one follower that must pass through a straight passage in a wall, which serves as the obstacle. In its present form, I cannot recommend this paper for publication, as several significant issues are present.
+
+I think Section 2 ends too abruptly. The discussion could be improved by explaining DQNs in more detail, clarifying the introduced loss function, and outlining the parameters that require tuning for the experiments.
+I suggest adding the terms d_{des} and \psi_{des} to Fig 1. Furthermore, the 'e' vector appears misaligned; should it not be P_{des} - [x_F, y_F] shouldn't it?
+Fig 2 needs several improvements: "actio" is a typo, the 'l' in "proportional" is misaligned. The controller equations are difficult to understand due to formatting. The meaning of the "error" arrow inside the controller block is unclear.
+Figure 3 requires significant improvement: 1) Many arrows are misaligned, hindering comprehension. 2) Some text is unreadable due to occlusion by lines or blocks. 3) The subtitles are inconsistent; while the "State" block lists its contents, the "Reward" block has the subtitle "goal/collision" and the target network has "periodic update," which can be misleading. 4) Several text elements are misaligned (e.g., the subscript for r_t appears before the letter).
+Regarding the experiments and the comparison with Fig 4: given that the door is 1m wide, all scenarios appear to start far from it. Furthermore, the path for the "hard" case seems to be a nearly straight line with only a minor curve near the passage. This suggests either the figure does not accurately represent the problem, or the text contains errors, as all scenarios appear relatively easy. The impact would be greater if the scenarios were clearly differentiated: e.g., easy - the leader can follow a straight line to the goal; medium - the leader requires a small curve; hard - the start position is as close as possible to the wall.
+I have several observations regarding Figure 5. The wall should be added to this plot. The initial and goal points here appear closer and the path more curved than in Figure 4, where all three scenarios seem to follow straight lines. This discrepancy may be due to different scales in the figures, which should be corrected. The wall in Figure 4 seems to be at x=2, while here it appears at x=0; this inconsistency must be resolved. Also, are the initial positions shown correct? They seem different from the description in Section 5.B.
+Regarding Figure 6, the axis labels are inconsistent with the data presented (x, y vs. time, distance). Furthermore, the claim that “The Hard scenario, despite starting at a similar distance to the Medium case, takes the longest to complete …” is not supported by the figure, which clearly shows the medium case taking the most time.
+It remains unclear why the statement “the leader’s policy was trained independently”
+y” holds true, since equation (8) clearly shows a dependency on the follower’s state.
+The experiments section contains significant data inconsistencies. The abstract, Figure 4, and Section 5.A describe a 1m wide passage and a desired inter-robot distance of 0.3m. However, Section 5.E and Section 6 refer to a 0.8m wide passage and an approximate resulting inter-robot distance of 0.5m. This suggests one of two things: the authors conducted different experiments and conflated them, which could explain the discrepancies between the figures and the discussion; or this is a typographical error. If it is the latter, the fact that the robots maintained a 0.5m distance indicates a major problem with the control formulation, as this is nearly double the desired 0.3m. In either case, I cannot be confident that the discussion in Section 5 corresponds accurately to the presented figures, making it impossible to assess the quality of the results.
+Furthermore, the authors claim to have addressed obstacle-rich environments, yet only one scenario is shown, with variations only in the initial and goal positions. This scenario (though not explicitly stated) appears (based on Figure 4) to be a 6 x 4 m² empty space with a ~0.3m thick, ~6m long wall centered at (x=2, y=0), featuring a 1m wide passage in its center. This constitutes an environment with two static obstacles, not a richly complex one.
+Minor issues:
+• Avoid using \pi for the policy on page 2, as it is also used later for the constant 3.14.
+• For control-related papers, it is important to avoid imprecise terminology: “robust classical control” on page 2 implies strategies different from those used here; “adaptive obstacle avoidance” can have a specific, different meaning in control theory.
+• The term “slave node” on page 3 is strongly discouraged in modern technical literature.
+• The paper states a shallow network was used for reinforcement learning; can the approach then legitimately be called "Deep Q-Network based"?
+• Confusing sentences: “r_{dist} provides dense feedback based on progress toward the goal.” on page 3; “we set up a delay of four steps to maintain the most recent leader state between updates” on page 3
+• Inconsistent symbols: d_{gap} on page 4 and Table 1 (could be the same as d_{des} on page 2); k_{dist} and k_{angle} on page 4 (probably the same as k_v and k_\omega in (16))
+• Undefined symbols: tuple (s, a, r, s’) on page 2 , the sets used in (17) and (18); learning rate \alpha, exploration decay \lambda, and k_d in Table 1.
+
+Reviewer #2
+Questions
+1. Originality of the work (How do you evaluate the originality of the work presented in this paper ?)
+3. Average originality
+2. Contribution to the field (How do do you evaluate the paper's contribution to the field?):
+3. Small but clear contribution
+3. Technical strength (How do you evaluate the technical strength of the paper?):
+4. Good
+4. Paper Clarity and Organization (How do you evaluate the clarity and organization of the paper?)
+5. Excellent
+5. Recommendation for this paper (What do you recommend for this paper?):
+4. Weak Accept - I will not fight strongly in favor of acceptance
+6. Comments to the authors (Please provide the authors some feedback on the scores you gave for the originality of the work, contribution to the field, technical strength, clarity and organization multiple choice reviews, and also provide some feedback on how they can improve their paper):
+This article aims to propose and validate a hybrid control architecture for leader-follower formation in non-holonomic mobile robots operating in obstacle-filled environments. The work clearly presents the methodology adopted and the results obtained, which indicate that the hybrid approach enables adaptive navigation with formation preservation, even in narrow passages and challenging scenarios.
+
+The combination of classical algorithms with more recent techniques based on deep learning constitutes one of the main strengths of the work. However, the proposal still needs to be evaluated more robustly and compared quantitatively with state-of-the-art met
+hods.
+
+Overall, for an article intended for conference presentation, the work presents a good technical and scientific level.
