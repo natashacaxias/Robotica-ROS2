@@ -1,114 +1,42 @@
-# RL Algorithm Comparison Framework
+# Leader-Follower Formation Control via Deep Q-Networks
 
-Rigorous comparison of **DQN**, **Dueling DQN**, **PPO**, and **Rainbow DQN** in a leader-follower formation control environment.
+Hybrid control for non-holonomic mobile robots in obstacle-rich environments: a **Deep Q-Network (DQN) leader** learns to reach a goal while avoiding static obstacles, and a **follower** tracks a virtual point behind the leader with a classical proportional controller. Learning handles navigation; classical control keeps the formation.
 
-## Quick Start
+The scenario is a room with an internal wall and a narrow passage (1.0 m) that both robots must cross while keeping a 0.3 m formation distance. Policies are evaluated from three initial configurations of increasing difficulty (`easy`, `medium`, `hard`).
 
-### 1. Install dependencies
+Part of my undergraduate research (PIBIC / UFAM) on reinforcement learning for multi-robot systems. Related publications (accepted at CSBC 2026):
 
-```bash
-pip install -r requirements.txt
-```
+- *Follower-Aware Reward Shaping for Non-Holonomic Leader Navigation via Dueling Deep Q-Networks* (CTIC)
+- *Hybrid Reinforcement Learning Architecture with Geometric Curriculum Learning for Non-Holonomic Leader-Follower Navigation* (SEMISH)
 
-> **Note:** PyTorch must be installed with CUDA support for GPU acceleration. See [pytorch.org](https://pytorch.org/get-started/locally/).
+## Repository map
 
-### 2. Run all experiments (4 algorithms × 3 seeds = 12 runs)
+| Path | Contents |
+|---|---|
+| `atual/` | Current implementation: environment (`env.py`), Dueling DQN (`model.py`), parallel trainer (`trainer.py`), training and evaluation entry points (`train.py`, `run_all.py`), plotting and animation utilities |
+| `atual/logs/{easy,medium,hard}/` | Episode traces (CSV), trajectory and velocity plots, and animations for each evaluation scenario |
+| `src/p3at_qlearning_simulation_v2/` | ROS 2 package: Pioneer 3-AT model (URDF/xacro), multi-robot launch file, and controller nodes that run learned policies |
+| `rl_comparison.zip`, `docs/rl_comparison_framework.md` | Framework comparing DQN, Dueling DQN, PPO and Rainbow under identical controls (3 seeds each) |
+| `*.tex`, `calc_metrics.py`, `run_experiment.py` | Result tables and scripts for the comparison experiments |
 
-```bash
-cd c:\dqn\rl_comparison
-python run_all.py
-```
-
-This will sequentially train all 12 combinations. Each run trains for **1,000,000 environment steps** with periodic evaluation every 50,000 steps.
-
-### 3. Run a single experiment
+## Running the training
 
 ```bash
-python run_experiment.py --algo dqn --seed 42
-python run_experiment.py --algo dueling_dqn --seed 42
-python run_experiment.py --algo ppo --seed 42
-python run_experiment.py --algo rainbow --seed 42
+cd atual
+pip install -r requirements.txt      # numpy, matplotlib, pandas, pillow
+pip install torch                    # pick the build for your CUDA version: https://pytorch.org
+python train.py
 ```
 
-### 4. Generate comparison plots
+`train.py` trains with 12 parallel environments (up to 10,000 episodes), then evaluates the policy on the three scenarios and generates plots and animations. A GPU is used automatically when available.
 
-```bash
-python plots/generate_plots.py
-```
+## Design notes
 
-Outputs are saved to `plots/output/`:
-- `learning_curves.png` — reward convergence (mean ± std)
-- `bar_success_rate.png` — final success rate by scenario
-- `bar_collision_rate.png` — collision rate by scenario
-- `eval_success_over_time.png` — success during training per scenario
-- `generalization_table.csv` / `.tex` — 500-episode generalization results
-- `statistical_tests.csv` — Mann-Whitney U pairwise tests
+- **Action space:** 40 discrete actions (5 linear velocities x 8 angular velocities).
+- **Simulation:** 0.05 s timestep with actuation delay modeled in the environment.
+- **Policy network:** Dueling DQN, trained with experience replay and periodic target-network sync.
+- **ROS 2 side:** `src/` runs learned policies on simulated Pioneer 3-AT robots; the training itself uses the lightweight Python environment for speed.
 
-## Project Structure
+## Status
 
-```
-rl_comparison/
-├── env/                        # Environment wrapper
-│   └── leader_follower_env.py  # Gymnasium wrapper (imports original env.py)
-├── models/                     # Network architectures
-│   ├── backbone.py             # Shared 3×256 MLP backbone
-│   ├── dqn.py                  # Vanilla DQN head
-│   ├── dueling_dqn.py          # Dueling DQN (Value + Advantage)
-│   ├── ppo.py                  # PPO Actor-Critic
-│   └── rainbow.py              # Rainbow DQN (NoisyLinear Dueling)
-├── training/                   # Training algorithms
-│   ├── config.py               # Frozen global configuration
-│   ├── curriculum.py           # Step-based curriculum schedule
-│   ├── replay_buffer.py        # Uniform, PER, NStep buffers
-│   ├── trainer_dqn.py          # DQN trainer
-│   ├── trainer_dueling.py      # Dueling DQN trainer
-│   ├── trainer_ppo.py          # PPO trainer
-│   └── trainer_rainbow.py      # Rainbow trainer
-├── evaluation/                 # Evaluation protocols
-│   ├── evaluator.py            # Periodic eval (100 ep, fixed geometry)
-│   └── generalization.py       # Post-training (500 ep, random geometry)
-├── plots/
-│   └── generate_plots.py       # All comparison visualisations
-├── logs/                       # Raw CSVs (auto-generated)
-├── run_experiment.py           # Single run: --algo X --seed Y
-├── run_all.py                  # Full suite orchestrator
-├── requirements.txt
-└── README.md
-```
-
-## Experimental Controls
-
-The following are **identical** across all algorithms:
-
-| Element           | Value                           |
-| ----------------- | ------------------------------- |
-| Observation space | 108-dim (3-frame stacking)      |
-| Action space      | Discrete(40)                    |
-| Reward function   | Original `env.py` (unchanged)   |
-| Network backbone  | 3 × 256 MLP w/ LayerNorm + ReLU |
-| Training budget   | 1,000,000 env steps             |
-| Batch size        | 128                             |
-| Learning rate     | 3e-4                            |
-| γ (discount)      | 0.99                            |
-| Gradient clipping | ‖∇‖ ≤ 10                        |
-| Curriculum        | 3-phase (250k/750k/1M steps)    |
-| Eval protocol     | 100 ep every 50k steps          |
-| Random seeds      | 42, 123, 456                    |
-
-## Algorithms
-
-| Algorithm       | Key Differences                                          |
-| --------------- | -------------------------------------------------------- |
-| **DQN**         | Uniform replay, Double DQN target, ε-greedy              |
-| **Dueling DQN** | Value/Advantage streams, PER, Double DQN, ε-greedy       |
-| **PPO**         | On-policy, GAE(λ=0.95), clipped surrogate, entropy bonus |
-| **Rainbow**     | PER + Double DQN + Dueling + NoisyNet + 3-step returns   |
-
-## Expected Runtime
-
-~2–4 hours per run on GPU (RTX 3060+), total ~24–48 hours for all 12 runs.
-On CPU: ~8–12 hours per run.
-
-## Citation
-
-If using this framework, please cite the accompanying article on leader-follower formation control via DQN.
+Research code, under active development. Model checkpoints and archives are kept in the repository.
